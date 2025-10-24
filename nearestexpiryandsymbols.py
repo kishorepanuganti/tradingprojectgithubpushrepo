@@ -1,4 +1,6 @@
 import logging
+import os
+import pandas as pd
 from datetime import datetime
 from fyers_api317.fyers_apiv3 import fyersModel
 import credentialsfyer
@@ -133,8 +135,17 @@ def start_websocket(symbols):
     from fyers_api317.fyers_apiv3.FyersWebsocket import data_ws
     
     def onmessage(message):
-   
-        print("Response:", message)
+        try:
+            # Convert message to DataFrame
+            df = pd.DataFrame([message])
+            
+            # Save to CSV file, append mode
+            df.to_csv('symbol_data.csv', mode='a', header=not os.path.exists('symbol_data.csv'), index=False)
+            
+            # Optional: Print response for monitoring
+            print("Response saved:", message)
+        except Exception as e:
+            print(f"Error saving data: {e}")
 
 
     def onerror(message):
