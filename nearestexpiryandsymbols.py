@@ -1,10 +1,11 @@
+
 import logging
 import os
 import pandas as pd
 from datetime import datetime
-from fyers_api317.fyers_apiv3 import fyersModel
+from fyers_apiv3 import fyersModel
 import credentialsfyer
-from fyers_api317.fyers_apiv3.FyersWebsocket import data_ws
+from fyers_apiv3.FyersWebsocket import data_ws
 
 
 
@@ -31,6 +32,9 @@ fyers = fyersModel.FyersModel(
 # -----------------------------
 # Core Functions
 # -----------------------------
+import logging
+from datetime import datetime
+
 def safe_get_optionchain(symbol: str, strikecount: int = 10):
     """Safely fetch option chain data for given symbol."""
     try:
@@ -48,29 +52,37 @@ def safe_get_optionchain(symbol: str, strikecount: int = 10):
         return None
 
 
-
 def get_nearest_index_expiry(nifty_chain, sensex_chain):
     """Compare expiries and return the nearest index and expiry date."""
     try:
+        # Extract expiry dates
         nifty_expiry = nifty_chain["data"]["expiryData"][0]["date"]
         sensex_expiry = sensex_chain["data"]["expiryData"][0]["date"]
 
+        # Extract all symbols from each chain
+        nifty_symbols = [item['symbol'] for item in nifty_chain['data']['optionsChain'] if 'symbol' in item]
+        sensex_symbols = [item['symbol'] for item in sensex_chain['data']['optionsChain'] if 'symbol' in item]
+
+        # Convert expiry strings to datetime
         nifty_date = datetime.strptime(nifty_expiry, "%d-%m-%Y")
         sensex_date = datetime.strptime(sensex_expiry, "%d-%m-%Y")
         today = datetime.now().date()
-        
+
+        # Pick the nearer expiry
         if nifty_date < sensex_date:
             nearest_index = "NIFTY"
             nearest_expiry = nifty_expiry
             nearest_chain = nifty_chain
             nearest_date = nifty_date
+            nearest_symbols = nifty_symbols
         else:
             nearest_index = "SENSEX"
             nearest_expiry = sensex_expiry
             nearest_chain = sensex_chain
             nearest_date = sensex_date
+            nearest_symbols = sensex_symbols
 
-                    # Calculate DTE (Days to Expiry)
+        # Calculate DTE (Days to Expiry)
         dte = (nearest_date.date() - today).days
         if dte < 0:
             dte_status = "Expired"
@@ -88,51 +100,17 @@ def get_nearest_index_expiry(nifty_chain, sensex_chain):
             "nearest_expiry": nearest_expiry,
             "dte": dte,
             "dte_status": dte_status,
-            "option_chain": nearest_chain
+            "option_chain": nearest_chain,
+            "nearest_symbols": nearest_symbols
         }
 
     except Exception as e:
-        print("Error while finding nearest expiry:", str(e))
+        logging.exception(f"Error while finding nearest expiry: {e}")
         return None
 
 
-
-def extract_nearest_expiry_symbols(chain_response, expiry_date):
-    """Extract all CE/PE option symbols that match the nearest expiry."""
-    if not chain_response or "data" not in chain_response:
-        logging.error("Invalid option chain data. Cannot extract symbols.")
-        return []
-
-    try:
-        options = chain_response["data"]["optionsChain"]
-
-        expiry_dt = datetime.strptime(expiry_date, "%d-%m-%Y")
-        yy = expiry_dt.strftime("%y")
-        month_map = {
-            1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6",
-            7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"
-        }
-        m = month_map[expiry_dt.month]
-        dd = expiry_dt.strftime("%d")
-        expiry_pattern = f"{yy}{m}{dd}"
-
-        symbols = [
-            opt["symbol"]
-            for opt in options
-            if expiry_pattern in opt.get("symbol", "")
-            and opt.get("option_type") in ["CE", "PE"]
-        ]
-
-        return symbols
-
-    except Exception as e:
-        logging.exception(f"Error extracting symbols: {e}")
-        return []
-
-
-
 def start_websocket(symbols):
-    from fyers_api317.fyers_apiv3.FyersWebsocket import data_ws
+    from fyers_apiv3.FyersWebsocket import data_ws
     
     def onmessage(message):
         try:
@@ -140,7 +118,7 @@ def start_websocket(symbols):
             df = pd.DataFrame([message])
             
             # Save to CSV file, append mode
-            df.to_csv('symbol_data.csv', mode='a', header=not os.path.exists('symbol_data.csv'), index=False)
+            df.to_csv('24octdata.csv', mode='a', header=not os.path.exists('24octdata.csv'), index=False)
             
             # Optional: Print response for monitoring
             print("Response saved:", message)
@@ -159,6 +137,8 @@ def start_websocket(symbols):
 
 
     def onopen():
+
+        
     
         # Specify the data type and symbols you want to subscribe to
         data_type = "SymbolUpdate"
@@ -176,7 +156,7 @@ def start_websocket(symbols):
     datasocket = data_ws.FyersDataSocket(
         access_token=access_token,       # Access token in the format "appid:accesstoken"
         log_path="",                     # Path to save logs. Leave empty to auto-create logs in the current directory.
-        litemode=True,                  # Lite mode disabled. Set to True if you want a lite response.
+        litemode=False,                  # Lite mode disabled. Set to True if you want a lite response.
         write_to_file=False,              # Save response in a log file instead of printing it.
         reconnect=True,                  # Enable auto-reconnection to WebSocket on disconnection.
         on_connect=onopen,               # Callback function to subscribe to data upon connection.
@@ -189,7 +169,6 @@ def start_websocket(symbols):
     # Establish a connection to the Fyers WebSocket
    
     datasocket.connect()
-
 
 # -----------------------------
 # Execution Flow
@@ -212,7 +191,8 @@ def main():
     nearest_expiry = result["nearest_expiry"]
     dte = result["dte"]
     dte_status = result["dte_status"]
-
+    nearest_symbols = result["nearest_symbols"]
+    
     print(dte)
     nearest_chain = result["option_chain"]
 
@@ -221,8 +201,11 @@ def main():
         logging.error("Unable to determine nearest expiry.")
         return
 
-    symbols = extract_nearest_expiry_symbols(nearest_chain, nearest_expiry)
+    symbols = nearest_symbols
 
+    
+    
+    
     if not symbols:
         logging.warning("No symbols found for nearest expiry.")
         return
@@ -247,4 +230,3 @@ def main():
 # -----------------------------
 if __name__ == "__main__":
     main()
-
