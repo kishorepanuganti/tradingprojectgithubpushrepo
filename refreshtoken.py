@@ -1,6 +1,6 @@
 import os, requests, json
 from datetime import datetime, timedelta
-from fyers_api317.fyers_apiv3 import fyersModel
+from fyers_apiv3 import fyersModel
 import credentialsfyer
 
 
