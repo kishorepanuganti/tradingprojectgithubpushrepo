@@ -1,7 +1,7 @@
 
 # Import the required module from the fyers_apiv3 package
 import webbrowser
-from fyers_api317.fyers_apiv3 import fyersModel
+from fyers_apiv3 import fyersModel
 import requests
 import credentialsfyer
 
