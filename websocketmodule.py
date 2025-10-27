@@ -4,9 +4,9 @@ import os
 from urllib import response
 import pandas as pd
 from datetime import datetime
-from fyers_api317.fyers_apiv3 import fyersModel
+from fyers_apiv3 import fyersModel
 import credentialsfyer
-from fyers_api317.fyers_apiv3.FyersWebsocket import data_ws
+from fyers_apiv3.FyersWebsocket import data_ws
 
 
 def start_websocket(symbols, live_data_store):
@@ -22,7 +22,7 @@ def start_websocket(symbols, live_data_store):
             df = pd.DataFrame([message])
             
             # Save to CSV file, append mode
-            df.to_csv('25oct.csv', mode='a', header=not os.path.exists('25oct.csv'), index=False)
+            df.to_csv('27oct.csv', mode='a', header=not os.path.exists('27oct.csv'), index=False)
 
             # Optional: Print response for monitoring
             print("Response saved:", message)
