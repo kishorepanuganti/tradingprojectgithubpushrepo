@@ -3,9 +3,9 @@ import logging
 import os
 import pandas as pd
 from datetime import datetime
-from fyers_api317.fyers_apiv3 import fyersModel
+from fyers_apiv3 import fyersModel
 import credentialsfyer
-from fyers_api317.fyers_apiv3.FyersWebsocket import data_ws
+from fyers_apiv3.FyersWebsocket import data_ws
 import nearestexpiryandsymbols as nearsym
 from reply_from_csv import replay_csv
 from testentrylogic import decide_entry, start_entry_loop
@@ -91,7 +91,7 @@ def main():
     #websocketmodule.start_websocket(symbols)
     
 
-    MODE = "BACKTEST"  # Change to "REPLAY" for CSV replay mode
+    MODE = "LIVE"  # Change to "REPLAY" for CSV replay mode
 
     csv_path = '24octniftysymbolsdata.csv'
 
