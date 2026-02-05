@@ -1,0 +1,722 @@
+# strategies/otm_sl_buy.py
+"""
+OTM Stoploss Buy Strategy
+
+Short Strangle variant with delayed re-entry and hedging logic:
+1. Start with SHORT strangle (sell CE + PE at target premiums)
+2. When stoploss hits on a leg:
+   - Square off that SHORT leg
+   - Enter BUY position on same option type with small premium
+   - Wait 5 minutes before re-entering SHORT position
+3. BUY position has own target/SL
+4. After 5 minutes: close BUY (if open) and re-enter SHORT
+5. CE and PE legs work independently
+"""
+
+import logging
+import time
+from typing import Optional, Dict, Any
+
+try:
+    from .base import BaseStrategy
+except Exception:
+    from basestrategy import BaseStrategy
+
+from strike_utils import select_by_premium, find_hedge_strike
+from order_logger import get_order_logger
+from config.config import OTM_SL_BUY_SETTINGS, PAPER_TRADING_MODE
+
+logger = logging.getLogger(__name__)
+
+
+class OtmSLBuy(BaseStrategy):
+    """
+    OTM Stoploss Buy Strategy
+    
+    SHORT Position Parameters:
+    - NIFTY: Target ~10 Rs premium per leg, Target +3Rs / SL -3Rs
+    - SENSEX: Target ~50 Rs premium per leg, Target +12Rs / SL -12Rs
+    
+    BUY Position Parameters (after SHORT SL hit):
+    - NIFTY: Target ~5 Rs premium, Target +3Rs / SL -1Rs
+    - SENSEX: Target ~15 Rs premium, Target +15Rs / SL -5Rs
+    
+    Timing:
+    - 5-minute (300 seconds) wait before re-entering SHORT after SL hit
+    """
+    
+    # Leg states
+    STATE_IDLE = "IDLE"
+    STATE_SHORT_ACTIVE = "SHORT_ACTIVE"
+    STATE_BUY_ACTIVE = "BUY_ACTIVE"
+    STATE_WAITING = "WAITING"
+    
+    def __init__(self, trade_ctx, live_data, broker=None, qty=0):
+        super().__init__(trade_ctx, live_data, broker, qty)
+        
+        # Get index and settings from config
+        self.index = trade_ctx.get("index", "NIFTY")
+        settings = OTM_SL_BUY_SETTINGS.get(self.index, OTM_SL_BUY_SETTINGS["NIFTY"])
+        
+        # Use passed qty if > 0, else fallback to config
+        if self.qty == 0:
+            self.qty = settings["qty"]
+        
+        # Get premiums and parameters from config
+        self.short_target_ltp = settings["short_target_premium"]
+        self.buy_target_ltp = settings["buy_target_premium"]
+        
+        # Get absolute profit/stop-loss values from config
+        self.short_params = {
+            "target": settings["short_target"],
+            "stoploss": settings["short_stoploss"]
+        }
+        self.buy_params = {
+            "target": settings["buy_target"],
+            "stoploss": settings["buy_stoploss"]
+        }
+        
+        # Delay from config (convert minutes to seconds)
+        self.REENTRY_DELAY_SECONDS = settings["reenter_delay_minutes"] * 60
+        self.MAX_ADJUSTMENTS_PER_LEG = settings.get("max_adjustments", 30)
+        
+        # CE leg state
+        self.ce_state = {
+            'state': self.STATE_IDLE,
+            'position': None,  # {symbol, entry_price, qty, side, leg}
+            'sl_hit_time': None,
+            'adjustment_count': 0
+        }
+        
+        # PE leg state
+        self.pe_state = {
+            'state': self.STATE_IDLE,
+            'position': None,
+            'sl_hit_time': None,
+            'adjustment_count': 0
+        }
+        
+        # All positions for tracking
+        self.positions = {}
+        
+        # Last selected strikes
+        self.last_selected = {"ce": None, "pe": None}
+        
+        # Track realized P&L
+        self.realized_pnl = 0.0
+        
+        # Track hedges
+        self.hedges = {"CE": None, "PE": None}
+    
+    def start(self):
+        """Initialize strategy."""
+        logger.info(
+            f"[OtmSLBuy] Started for {self.index} | "
+            f"SHORT Target LTP={self.short_target_ltp} | "
+            f"BUY Target LTP={self.buy_target_ltp} | "
+            f"DTE={self.trade_ctx.get('dte', 0)}"
+        )
+    
+    
+    def _on_position_tick(self, symbol: str, tick: dict):
+        """
+        REAL-TIME callback - called immediately when position symbol receives tick.
+        
+        This enables instant target/SL checks (no 5-second delay).
+        Orders are executed as soon as target/SL is hit.
+        """
+        # Determine which leg this symbol belongs to
+        if self.ce_state.get('position', {}).get('symbol') == symbol:
+            self._check_position_target_sl('CE', self.ce_state, symbol, tick)
+        elif self.pe_state.get('position', {}).get('symbol') == symbol:
+            self._check_position_target_sl('PE', self.pe_state, symbol, tick)
+    
+    def _check_position_target_sl(self, leg_type: str, leg_state: dict, symbol: str, tick: dict):
+        """
+        Check target/SL for a position - called on EVERY tick update (real-time).
+        
+        Args:
+            leg_type: "CE" or "PE"
+            leg_state: Reference to ce_state or pe_state
+            symbol: Position symbol
+            tick: Real-time tick data
+        """
+        if not tick or 'ltp' not in tick:
+            return
+        
+        position = leg_state.get('position')
+        if not position:
+            return
+        
+        current_state = leg_state['state']
+        
+        try:
+            current_ltp = float(tick['ltp'])
+        except (TypeError, ValueError):
+            return
+        
+        # Update position LTP
+        if symbol in self.positions:
+            self.positions[symbol]['current_ltp'] = current_ltp
+        
+        # SHORT_ACTIVE state: Check SHORT target/SL
+        if current_state == self.STATE_SHORT_ACTIVE:
+            entry_price = position['entry_price']
+            pnl = entry_price - current_ltp  # SHORT P&L
+            
+            if pnl >= self.short_params["target"]:
+                logger.info(f"[OtmSLBuy] SHORT {leg_type} TARGET HIT (real-time): P&L={pnl:.2f} Rs | {symbol}")
+                self._square_off_position(leg_type, leg_state, symbol)
+                self._require_scan()  # Need to scan for re-entry
+                leg_state['state'] = self.STATE_IDLE
+            
+            elif pnl <= -self.short_params["stoploss"]:
+                logger.warning(f"[OtmSLBuy] SHORT {leg_type} STOPLOSS HIT (real-time): P&L={pnl:.2f} Rs | {symbol}")
+                if leg_state['adjustment_count'] >= self.MAX_ADJUSTMENTS_PER_LEG:
+                    logger.warning(f"[OtmSLBuy] Max {leg_type} adjustments reached, closing ALL positions")
+                    self.stop(f"Max {leg_type} Adjustments Reached")
+                    return
+                else:
+                    self._square_off_position(leg_type, leg_state, symbol)
+                    self._require_scan()  # Need to scan for BUY hedge
+                    leg_state['sl_hit_time'] = time.time()
+                    leg_state['adjustment_count'] += 1
+                    leg_state['state'] = self.STATE_BUY_ACTIVE
+                    logger.info(f"[OtmSLBuy] {leg_type} switched to BUY_ACTIVE | Adjustment #{leg_state['adjustment_count']}")
+        
+        # BUY_ACTIVE state: Check BUY target/SL
+        elif current_state == self.STATE_BUY_ACTIVE:
+            entry_price = position['entry_price']
+            pnl = current_ltp - entry_price  # LONG P&L
+            
+            if pnl >= self.buy_params["target"]:
+                logger.info(f"[OtmSLBuy] BUY {leg_type} TARGET HIT (real-time): P&L={pnl:.2f} Rs | {symbol}")
+                self._square_off_position(leg_type, leg_state, symbol)
+                leg_state['state'] = self.STATE_WAITING
+            
+            elif pnl <= -self.buy_params["stoploss"]:
+                logger.warning(f"[OtmSLBuy] BUY {leg_type} STOPLOSS HIT (real-time): P&L={pnl:.2f} Rs | {symbol}")
+                self._square_off_position(leg_type, leg_state, symbol)
+                leg_state['state'] = self.STATE_WAITING
+                
+            # Time Check (Real-time enforcement)
+            elif leg_state.get('sl_hit_time'):
+                elapsed = time.time() - leg_state['sl_hit_time']
+                if elapsed >= self.REENTRY_DELAY_SECONDS:
+                    logger.info(f"[OtmSLBuy] 5-minute Max Life Reached (real-time check) for {leg_type} | Closing BUY")
+                    self._square_off_position(leg_type, leg_state, symbol)
+                    self._reenter_short_position(leg_type, leg_state, self.trade_ctx.get("option_symbols", []))
+
+    def on_tick(self):
+        """Main strategy logic - called every tick."""
+        option_symbols = self.trade_ctx.get("option_symbols", [])
+        if not option_symbols:
+            logger.warning("[OtmSLBuy] No option symbols available")
+            return
+        
+        # Update current positions with latest LTP
+        self._update_position_ltps()
+        
+        # Handle CE leg
+        self._handle_leg("CE", self.ce_state, option_symbols)
+        
+        # Handle PE leg
+        self._handle_leg("PE", self.pe_state, option_symbols)
+        
+        # Report positions to tracker
+        if self.positions:
+            metadata = {
+                'ce_state': self.ce_state['state'],
+                'pe_state': self.pe_state['state'],
+                'ce_adjustments': self.ce_state['adjustment_count'],
+                'pe_adjustments': self.pe_state['adjustment_count'],
+            }
+            self.report_positions(self.positions, metadata=metadata, realized_pnl=self.realized_pnl)
+    
+    def _handle_leg(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """
+        Handle state machine for a single leg (CE or PE).
+        
+        Args:
+            leg_type: "CE" or "PE"
+            leg_state: Reference to ce_state or pe_state dict
+            option_symbols: List of available option symbols
+        """
+        current_state = leg_state['state']
+        
+        if current_state == self.STATE_IDLE:
+            self._handle_idle_state(leg_type, leg_state, option_symbols)
+        
+        elif current_state == self.STATE_SHORT_ACTIVE:
+            self._handle_short_active_state(leg_type, leg_state, option_symbols)
+        
+        elif current_state == self.STATE_BUY_ACTIVE:
+            self._handle_buy_active_state(leg_type, leg_state, option_symbols)
+        
+        elif current_state == self.STATE_WAITING:
+            self._handle_waiting_state(leg_type, leg_state, option_symbols)
+    
+    def _handle_idle_state(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """Handle IDLE state - enter SHORT position."""
+        # Select strike with target premium
+        symbol, ltp = select_by_premium(
+            option_symbols,
+            self.live_data,
+            target_premium=self.short_target_ltp,
+            ce_pe_type=leg_type
+        )
+        
+        if not symbol:
+            return
+        
+        # Check if strike changed or first entry
+        last_key = "ce" if leg_type == "CE" else "pe"
+        if symbol != self.last_selected[last_key]:
+            self.last_selected[last_key] = symbol
+            
+            # Enter SHORT position
+            self._enter_short_position(leg_type, leg_state, symbol, ltp)
+    
+    def _handle_short_active_state(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """Handle SHORT_ACTIVE state - monitor for target/SL."""
+        position = leg_state['position']
+        if not position:
+            return
+        
+        symbol = position['symbol']
+        entry_price = position['entry_price']
+        
+        # Get current LTP
+        tick = self.live_data.get(symbol)
+        if not tick or "ltp" not in tick:
+            return
+        
+        try:
+            current_ltp = float(tick["ltp"])
+        except (TypeError, ValueError):
+            return
+        
+        # Calculate P&L (for short position: profit when LTP decreases)
+        pnl = entry_price - current_ltp
+        
+        # Check target hit
+        if pnl >= self.short_params["target"]:
+            logger.info(f"[OtmSLBuy] SHORT {leg_type} TARGET HIT: P&L={pnl:.2f} | {symbol}")
+            self._square_off_position(leg_type, leg_state, symbol)
+            leg_state['state'] = self.STATE_IDLE
+        
+        # Check stoploss hit
+        elif pnl <= -self.short_params["stoploss"]:
+            logger.warning(f"[OtmSLBuy] SHORT {leg_type} STOPLOSS HIT: P&L={pnl:.2f} | {symbol}")
+            
+            # Check max adjustments
+            if leg_state['adjustment_count'] >= self.MAX_ADJUSTMENTS_PER_LEG:
+                logger.warning(
+                    f"[OtmSLBuy] Max {leg_type} adjustments ({self.MAX_ADJUSTMENTS_PER_LEG}) reached"
+                )
+                self._square_off_position(leg_type, leg_state, symbol)
+                leg_state['state'] = self.STATE_IDLE
+                return
+            
+            # Square off SHORT and enter BUY hedge
+            self._square_off_position(leg_type, leg_state, symbol)
+            self._enter_buy_position(leg_type, leg_state, option_symbols)
+            leg_state['sl_hit_time'] = time.time()
+            leg_state['adjustment_count'] += 1
+            leg_state['state'] = self.STATE_BUY_ACTIVE
+    
+    def _handle_buy_active_state(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """Handle BUY_ACTIVE state - monitor BUY position and 5-min timer."""
+        position = leg_state['position']
+        sl_hit_time = leg_state['sl_hit_time']
+        
+        if not position or sl_hit_time is None:
+            return
+        
+        symbol = position['symbol']
+        entry_price = position['entry_price']
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - sl_hit_time
+        
+        # Get current LTP
+        tick = self.live_data.get(symbol)
+        if tick and "ltp" in tick:
+            try:
+                current_ltp = float(tick["ltp"])
+                
+                # Calculate P&L (for long position: profit when LTP increases)
+                pnl = current_ltp - entry_price
+                
+                # Check BUY target hit
+                if pnl >= self.buy_params["target"]:
+                    logger.info(f"[OtmSLBuy] BUY {leg_type} TARGET HIT: P&L={pnl:.2f} | {symbol}")
+                    self._square_off_position(leg_type, leg_state, symbol)
+                    leg_state['state'] = self.STATE_WAITING
+                    return
+                
+                # Check BUY stoploss hit
+                elif pnl <= -self.buy_params["stoploss"]:
+                    logger.warning(f"[OtmSLBuy] BUY {leg_type} STOPLOSS HIT: P&L={pnl:.2f} | {symbol}")
+                    self._square_off_position(leg_type, leg_state, symbol)
+                    leg_state['state'] = self.STATE_WAITING
+                    return
+            except (TypeError, ValueError):
+                pass
+        
+        # Check 5-minute timer
+        if elapsed_time >= self.REENTRY_DELAY_SECONDS:
+            logger.info(
+                f"[OtmSLBuy] 5-minute timer expired for {leg_type} | "
+                f"Closing BUY and re-entering SHORT"
+            )
+            # FORCE Close BUY position unconditionally first
+            if symbol in self.positions:
+                self._square_off_position(leg_type, leg_state, symbol)
+            
+            # Then attempt Re-enter SHORT position
+            self._reenter_short_position(leg_type, leg_state, option_symbols)
+    
+    def _handle_waiting_state(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """Handle WAITING state - wait for 5min timer then re-enter SHORT."""
+        sl_hit_time = leg_state['sl_hit_time']
+        
+        if sl_hit_time is None:
+            return
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - sl_hit_time
+        
+        # Check if 5 minutes passed
+        if elapsed_time >= self.REENTRY_DELAY_SECONDS:
+            logger.info(f"[OtmSLBuy] 5-minute wait complete for {leg_type} | Re-entering SHORT")
+            self._reenter_short_position(leg_type, leg_state, option_symbols)
+    
+    def _enter_short_position(self, leg_type: str, leg_state: Dict, symbol: str, ltp: float):
+        """Enter SHORT (sell) position."""
+        order_logger = get_order_logger("otm_sl_buy_orders.csv") if PAPER_TRADING_MODE else None
+        
+        order_data = {
+            "symbol": symbol,
+            "qty": self.qty,
+            "side": -1,  # -1 = SELL
+            "type": 2,  # MARKET
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": f"SHORT_{leg_type}",
+            "isSliceOrder": False,
+        }
+        
+        if PAPER_TRADING_MODE:
+            order_logger.log_order(
+                symbol=symbol,
+                qty=self.qty,
+                side=-1,
+                order_type=2,
+                entry_price=ltp,
+                order_tag=f"SHORT_{leg_type}",
+                status="PLACED"
+            )
+            self.positions[symbol] = {
+                "entry_price": ltp,
+                "qty": self.qty,
+                "side": -1,
+                "leg": leg_type
+            }
+            leg_state['position'] = self.positions[symbol].copy()
+            leg_state['position']['symbol'] = symbol
+            leg_state['state'] = self.STATE_SHORT_ACTIVE
+            logger.info(f"[PAPER] Logged SHORT {leg_type}: {symbol} @ {ltp}")
+        else:
+            resp = self.place_order_safe(order_data)
+            if resp.get("code") == 0:
+                self.positions[symbol] = {
+                    "entry_price": ltp,
+                    "qty": self.qty,
+                    "side": -1,
+                    "leg": leg_type
+                }
+                leg_state['position'] = self.positions[symbol].copy()
+                leg_state['position']['symbol'] = symbol
+                leg_state['state'] = self.STATE_SHORT_ACTIVE
+                logger.info(f"[OtmSLBuy] Placed SHORT {leg_type}: {symbol} @ {ltp}")
+                logger.info(f"[OtmSLBuy] Placed SHORT {leg_type}: {symbol} @ {ltp}")
+                
+                # ---------------------------
+                # HEDGE PLACEMENT (Protection)
+                # ---------------------------
+                if not self.hedges[leg_type]:
+                    try:
+                        from greeks_calculator import parse_symbol_info
+                        parsed = parse_symbol_info(symbol)
+                        
+                        if parsed:
+                            strike = parsed[0]
+                            index = self.trade_ctx.get("index", "NIFTY") 
+                            hedge_premium = 6.0 if index == "SENSEX" else 1.0
+                            
+                            hedge_sym, hedge_ltp = find_hedge_strike(
+                                self.trade_ctx.get("option_symbols", []),
+                                self.live_data,
+                                base_strike=strike,
+                                ce_pe_type=leg_type,
+                                target_premium=hedge_premium,
+                                max_strikes_away=20
+                            )
+                            
+                            if hedge_sym:
+                                self._place_hedge_order(hedge_sym, hedge_ltp, self.qty, leg_type)
+                    except Exception as e:
+                        logger.error(f"[OtmSLBuy] Failed to place {leg_type} hedge: {e}")
+            else:
+                logger.error(f"[OtmSLBuy] Failed to place SHORT {leg_type}: {resp.get('message')}")
+
+    def _place_hedge_order(self, symbol, ltp, qty, leg_type):
+        """Place BUY order for hedge protection."""
+        order_data = {
+            "symbol": symbol,
+            "qty": qty,
+            "side": 1,              # 1 = BUY
+            "type": 2,              # MARKET
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": f"HEDGE_{leg_type}",
+            "isSliceOrder": False,
+        }
+        
+        if PAPER_TRADING_MODE:
+             if symbol not in self.positions:
+                self.positions[symbol] = {
+                    "entry_price": ltp, 
+                    "qty": qty, 
+                    "side": 1, 
+                    "leg": leg_type, 
+                    "is_hedge": True
+                }
+                self.hedges[leg_type] = symbol
+                self._add_position_symbol(symbol)
+                logger.info(f"[PAPER] Placed HEDGE {leg_type}: {symbol} @ {ltp}")
+        else:
+            resp = self.place_order_safe(order_data)
+            if resp.get("code") == 0:
+                self.positions[symbol] = {
+                    "entry_price": ltp, 
+                    "qty": qty, 
+                    "side": 1, 
+                    "leg": leg_type, 
+                    "is_hedge": True
+                }
+                self.hedges[leg_type] = symbol
+                self._add_position_symbol(symbol)
+                logger.info(f"[OtmSLBuy] PLACED HEDGE {leg_type}: {symbol} @ {ltp}")
+            else:
+                logger.warning(f"[OtmSLBuy] Failed to place HEDGE {leg_type}: {resp.get('message')}")
+    
+    def _enter_buy_position(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """Enter BUY (long) position after SHORT SL hit."""
+        # Select strike with small premium
+        symbol, ltp = select_by_premium(
+            option_symbols,
+            self.live_data,
+            target_premium=self.buy_target_ltp,
+            ce_pe_type=leg_type
+        )
+        
+        if not symbol:
+            logger.warning(f"[OtmSLBuy] Could not find BUY strike for {leg_type}")
+            leg_state['state'] = self.STATE_WAITING
+            return
+        
+        order_logger = get_order_logger("otm_sl_buy_orders.csv") if PAPER_TRADING_MODE else None
+        
+        order_data = {
+            "symbol": symbol,
+            "qty": self.qty,
+            "side": 1,  # 1 = BUY
+            "type": 2,  # MARKET
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": f"BUY_{leg_type}",
+            "isSliceOrder": False,
+        }
+        
+        if PAPER_TRADING_MODE:
+            order_logger.log_order(
+                symbol=symbol,
+                qty=self.qty,
+                side=1,
+                order_type=2,
+                entry_price=ltp,
+                adjustment_count=leg_state['adjustment_count'],
+                order_tag=f"BUY_{leg_type}",
+                status="PLACED"
+            )
+            self.positions[symbol] = {
+                "entry_price": ltp,
+                "qty": self.qty,
+                "side": 1,
+                "leg": f"{leg_type}_BUY"
+            }
+            leg_state['position'] = self.positions[symbol].copy()
+            leg_state['position']['symbol'] = symbol
+            logger.info(
+                f"[PAPER] Logged BUY {leg_type}: {symbol} @ {ltp} | "
+                f"Adj #{leg_state['adjustment_count']}"
+            )
+        else:
+            resp = self.place_order_safe(order_data)
+            if resp.get("code") == 0:
+                self.positions[symbol] = {
+                    "entry_price": ltp,
+                    "qty": self.qty,
+                    "side": 1,
+                    "leg": f"{leg_type}_BUY"
+                }
+                leg_state['position'] = self.positions[symbol].copy()
+                leg_state['position']['symbol'] = symbol
+                self._add_position_symbol(symbol)  # Register for real-time monitoring
+
+                logger.info(f"[OtmSLBuy] Placed BUY {leg_type}: {symbol} @ {ltp} | Real-time monitoring ENABLED")
+            else:
+                logger.error(f"[OtmSLBuy] Failed to place BUY {leg_type}: {resp.get('message')}")
+                leg_state['state'] = self.STATE_WAITING
+    
+    def _reenter_short_position(self, leg_type: str, leg_state: Dict, option_symbols: list):
+        """Re-enter SHORT position after 5-minute delay."""
+        # Select strike with target premium
+        symbol, ltp = select_by_premium(
+            option_symbols,
+            self.live_data,
+            target_premium=self.short_target_ltp,
+            ce_pe_type=leg_type
+        )
+        
+        if not symbol:
+            logger.warning(f"[OtmSLBuy] Could not find SHORT re-entry strike for {leg_type}")
+            return
+        
+        # Enter SHORT position
+        self._enter_short_position(leg_type, leg_state, symbol, ltp)
+        leg_state['sl_hit_time'] = None  # Reset timer
+    
+    def _square_off_position(self, leg_type: str, leg_state: Dict, symbol: str):
+        """Close a position (reverse the side)."""
+        if symbol not in self.positions:
+            logger.warning(f"[OtmSLBuy] Position not found for {symbol}")
+            return
+        
+        pos_data = self.positions[symbol]
+        qty = pos_data["qty"]
+        side = pos_data["side"]
+        close_side = -side  # Reverse: SHORT=-1 → BUY=1, BUY=1 → SELL=-1
+        
+        order_logger = get_order_logger("otm_sl_buy_orders.csv") if PAPER_TRADING_MODE else None
+        
+        order_data = {
+            "symbol": symbol,
+            "qty": qty,
+            "side": close_side,
+            "type": 2,  # MARKET
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": "SQUARE_OFF",
+            "isSliceOrder": False,
+        }
+        
+        if PAPER_TRADING_MODE:
+            # Get current LTP for logging
+            tick = self.live_data.get(symbol)
+            current_ltp = float(tick["ltp"]) if tick and "ltp" in tick else 0
+            
+            # Calculate P&L based on position side
+            if side == -1:  # SHORT position
+                pnl = (pos_data["entry_price"] - current_ltp) * qty
+            else:  # LONG position
+                pnl = (current_ltp - pos_data["entry_price"]) * qty
+            
+            order_logger.log_order(
+                symbol=symbol,
+                qty=qty,
+                side=close_side,
+                order_type=2,
+                entry_price=current_ltp,
+                pnl=pnl,
+                order_tag="SQUARE_OFF",
+                status="PLACED"
+            )
+            self._remove_position_symbol(symbol)  # Unregister callback
+            del self.positions[symbol]
+            leg_state['position'] = None
+            logger.info(f"[PAPER] Logged square-off for {symbol} | P&L={pnl:.2f} | Real-time monitoring DISABLED")
+            
+            # Update Realized P&L
+            self.realized_pnl += pnl
+        else:
+            resp = self.place_order_safe(order_data)
+            if resp.get("code") == 0:
+                # Calculate Legh P&L
+                tick = self.live_data.get(symbol)
+                current_ltp = float(tick["ltp"]) if tick and "ltp" in tick else pos_data["entry_price"]
+                
+                # P&L Calculation: (Current - Entry) * Side * Qty
+                leg_pnl = (current_ltp - pos_data["entry_price"]) * pos_data["side"] * pos_data["qty"]
+                self.realized_pnl += leg_pnl
+                
+                self._remove_position_symbol(symbol)  # Unregister callback
+                del self.positions[symbol]
+                leg_state['position'] = None
+                logger.info(f"[OtmSLBuy] Squared off {symbol} | P&L: {leg_pnl:.2f} | Real-time monitoring DISABLED")
+            else:
+                logger.error(f"[OtmSLBuy] Failed to square off {symbol}: {resp.get('message')}")
+    
+    def _update_position_ltps(self):
+        """Update current LTP for all positions."""
+        for symbol, pos_data in self.positions.items():
+            tick = self.live_data.get(symbol)
+            if tick and "ltp" in tick:
+                try:
+                    current_ltp = float(tick["ltp"])
+                    pos_data["current_ltp"] = current_ltp
+                    
+                    # Calculate P&L based on side
+                    if pos_data["side"] == -1:  # SHORT
+                        pos_data["pnl"] = pos_data["entry_price"] - current_ltp
+                    else:  # LONG
+                        pos_data["pnl"] = current_ltp - pos_data["entry_price"]
+                except (TypeError, ValueError):
+                    pass
+    
+    def stop(self, reason: str):
+        """Close all positions."""
+        logger.info(f"[OtmSLBuy] Stopping: {reason}")
+        
+        # Square off all positions
+        for symbol in list(self.positions.keys()):
+            # Determine which leg this position belongs to
+            # Determine which leg this position belongs to
+            if symbol == self.ce_state.get('position', {}).get('symbol'):
+                self._square_off_position("CE", self.ce_state, symbol)
+            elif symbol == self.pe_state.get('position', {}).get('symbol'):
+                self._square_off_position("PE", self.pe_state, symbol)
+            elif self.positions[symbol].get('is_hedge'):
+                # Close hedge
+                self._square_off_position("HEDGE", {}, symbol)
+            else:
+                # Force close any other position
+                self._square_off_position("UNKNOWN", {}, symbol)
